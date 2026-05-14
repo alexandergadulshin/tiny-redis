@@ -1,0 +1,10 @@
+tiny-redis
+*.o
+*.dSYM/
+.DS_Store
+
+# AI tooling artifacts — keep out of public repo
+CLAUDE.md
+.claude/
+.aider*
+.cursor/
