@@ -332,13 +332,13 @@ void store_flushdb(void) {
 }
 
 void store_iter_keys(store_keys_cb cb, void *ctx) {
+    /* Skip expired entries but don't reap them here — that gets done by
+     * the active sweeper. Skipping (vs. reaping) means two consecutive
+     * iterations are guaranteed to yield the same set, which the KEYS
+     * command relies on (count pass + write pass). */
     for (size_t i = 0; i < cap; i++) {
         entry_t *e = table[i];
-        if (!IS_LIVE(e)) continue;
-        if (is_expired(e)) {
-            destroy_slot(i);
-            continue;
-        }
+        if (!IS_LIVE(e) || is_expired(e)) continue;
         cb(e->key, e->klen, ctx);
     }
 }

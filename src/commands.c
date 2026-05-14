@@ -117,6 +117,122 @@ static size_t do_dbsize(const resp_command *cmd, char *out, size_t cap) {
     return resp_write_integer(out, cap, (long long)store_dbsize());
 }
 
+static size_t do_flushdb(const resp_command *cmd, char *out, size_t cap) {
+    (void)cmd;
+    store_flushdb();
+    return resp_write_simple_string(out, cap, "OK");
+}
+
+static size_t do_incrby(const resp_command *cmd, char *out, size_t cap, long long delta) {
+    if (cmd->argc != 2) return reply_wrongargs(out, cap, "incr/decr");
+    long long new_val;
+    if (!store_incrby(cmd->argv[1], cmd->arglen[1], delta, &new_val)) {
+        return resp_write_error(out, cap, "ERR value is not an integer or out of range");
+    }
+    return resp_write_integer(out, cap, new_val);
+}
+
+static size_t do_incr(const resp_command *cmd, char *out, size_t cap) {
+    return do_incrby(cmd, out, cap,  1);
+}
+static size_t do_decr(const resp_command *cmd, char *out, size_t cap) {
+    return do_incrby(cmd, out, cap, -1);
+}
+
+static size_t do_mset(const resp_command *cmd, char *out, size_t cap) {
+    if (cmd->argc < 3 || (cmd->argc % 2) != 1) {
+        return reply_wrongargs(out, cap, "mset");
+    }
+    for (int i = 1; i < cmd->argc; i += 2) {
+        store_set(cmd->argv[i],   cmd->arglen[i],
+                  cmd->argv[i+1], cmd->arglen[i+1], -1);
+    }
+    return resp_write_simple_string(out, cap, "OK");
+}
+
+static size_t do_mget(const resp_command *cmd, char *out, size_t cap) {
+    if (cmd->argc < 2) return reply_wrongargs(out, cap, "mget");
+    int header_n = snprintf(out, cap, "*%d\r\n", cmd->argc - 1);
+    if (header_n <= 0 || (size_t)header_n >= cap) return 0;
+    size_t pos = (size_t)header_n;
+    for (int i = 1; i < cmd->argc; i++) {
+        size_t vlen;
+        const char *v = store_get(cmd->argv[i], cmd->arglen[i], &vlen);
+        size_t n = v
+            ? resp_write_bulk_string(out + pos, cap - pos, v, vlen)
+            : resp_write_null_bulk  (out + pos, cap - pos);
+        if (n == 0) return 0;
+        pos += n;
+    }
+    return pos;
+}
+
+/* KEYS: two-pass — count first to get the array header length right,
+ * then iterate again to emit each key. store_iter_keys skips (doesn't
+ * reap) expired entries, so the two passes see the same set. */
+
+typedef struct {
+    long long count;
+    char *out;
+    size_t cap;
+    size_t pos;
+    int overflow;
+} keys_ctx_t;
+
+static void keys_count_cb(const char *k, size_t klen, void *vctx) {
+    (void)k; (void)klen;
+    ((keys_ctx_t *)vctx)->count++;
+}
+
+static void keys_write_cb(const char *k, size_t klen, void *vctx) {
+    keys_ctx_t *c = vctx;
+    if (c->overflow) return;
+    size_t n = resp_write_bulk_string(c->out + c->pos, c->cap - c->pos, k, klen);
+    if (n == 0) { c->overflow = 1; return; }
+    c->pos += n;
+}
+
+static size_t do_keys(const resp_command *cmd, char *out, size_t cap) {
+    if (cmd->argc != 2) return reply_wrongargs(out, cap, "keys");
+    /* Only the "*" pattern is supported in v1. */
+    if (cmd->arglen[1] != 1 || cmd->argv[1][0] != '*') {
+        return resp_write_error(out, cap, "ERR only '*' pattern is supported");
+    }
+
+    keys_ctx_t ctx = {0};
+    ctx.out = out; ctx.cap = cap;
+    store_iter_keys(keys_count_cb, &ctx);
+
+    int header_n = snprintf(out, cap, "*%lld\r\n", ctx.count);
+    if (header_n <= 0 || (size_t)header_n >= cap) return 0;
+    ctx.pos = (size_t)header_n;
+
+    store_iter_keys(keys_write_cb, &ctx);
+    if (ctx.overflow) return resp_write_error(out, cap, "ERR response too large");
+    return ctx.pos;
+}
+
+static size_t do_append(const resp_command *cmd, char *out, size_t cap) {
+    if (cmd->argc != 3) return reply_wrongargs(out, cap, "append");
+    long long new_len = store_append(cmd->argv[1], cmd->arglen[1],
+                                     cmd->argv[2], cmd->arglen[2]);
+    if (new_len < 0) return resp_write_error(out, cap, "ERR out of memory");
+    return resp_write_integer(out, cap, new_len);
+}
+
+static size_t do_strlen(const resp_command *cmd, char *out, size_t cap) {
+    if (cmd->argc != 2) return reply_wrongargs(out, cap, "strlen");
+    long long n = store_strlen(cmd->argv[1], cmd->arglen[1]);
+    return resp_write_integer(out, cap, n < 0 ? 0 : n);
+}
+
+static size_t do_type(const resp_command *cmd, char *out, size_t cap) {
+    if (cmd->argc != 2) return reply_wrongargs(out, cap, "type");
+    /* We only have one type today: string. */
+    const char *ty = store_exists(cmd->argv[1], cmd->arglen[1]) ? "string" : "none";
+    return resp_write_simple_string(out, cap, ty);
+}
+
 size_t command_dispatch(const resp_command *cmd, char *out, size_t out_cap) {
     if (cmd->argc < 1) return resp_write_error(out, out_cap, "ERR empty command");
 
@@ -130,6 +246,15 @@ size_t command_dispatch(const resp_command *cmd, char *out, size_t out_cap) {
     if (cmd_is(cmd, "TTL"))     return do_ttl(cmd, out, out_cap);
     if (cmd_is(cmd, "COMMAND")) return do_command(cmd, out, out_cap);
     if (cmd_is(cmd, "DBSIZE"))  return do_dbsize(cmd, out, out_cap);
+    if (cmd_is(cmd, "FLUSHDB")) return do_flushdb(cmd, out, out_cap);
+    if (cmd_is(cmd, "INCR"))    return do_incr(cmd, out, out_cap);
+    if (cmd_is(cmd, "DECR"))    return do_decr(cmd, out, out_cap);
+    if (cmd_is(cmd, "MSET"))    return do_mset(cmd, out, out_cap);
+    if (cmd_is(cmd, "MGET"))    return do_mget(cmd, out, out_cap);
+    if (cmd_is(cmd, "KEYS"))    return do_keys(cmd, out, out_cap);
+    if (cmd_is(cmd, "APPEND"))  return do_append(cmd, out, out_cap);
+    if (cmd_is(cmd, "STRLEN"))  return do_strlen(cmd, out, out_cap);
+    if (cmd_is(cmd, "TYPE"))    return do_type(cmd, out, out_cap);
 
     return resp_write_error(out, out_cap, "ERR unknown command");
 }
