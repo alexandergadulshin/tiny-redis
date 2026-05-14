@@ -32,14 +32,44 @@ static int parse_int_line(const char *buf, size_t len, long long *out) {
     return (int)(span + 2);  /* include CRLF */
 }
 
+/* Inline protocol: "ARG ARG ARG\r\n", space-separated. Real Redis
+ * supports this and redis-benchmark uses it for PING_INLINE. */
+static resp_status parse_inline(const char *buf, size_t len,
+                                resp_command *cmd, size_t *consumed) {
+    const char *crlf = find_crlf(buf, len);
+    if (!crlf) return RESP_INCOMPLETE;
+
+    size_t line_end = (size_t)(crlf - buf);
+    cmd->argc = 0;
+
+    size_t i = 0;
+    while (i < line_end) {
+        while (i < line_end && (buf[i] == ' ' || buf[i] == '\t')) i++;
+        if (i == line_end) break;
+
+        size_t start = i;
+        while (i < line_end && buf[i] != ' ' && buf[i] != '\t') i++;
+
+        if (cmd->argc >= RESP_MAX_ARGS) return RESP_ERR;
+        cmd->argv[cmd->argc]   = buf + start;
+        cmd->arglen[cmd->argc] = i - start;
+        cmd->argc++;
+    }
+
+    if (cmd->argc == 0) return RESP_ERR;
+    *consumed = line_end + 2;
+    return RESP_OK;
+}
+
 resp_status resp_parse_command(const char *buf, size_t len,
                                resp_command *cmd, size_t *consumed) {
     if (len == 0) return RESP_INCOMPLETE;
 
-    /* We only accept arrays of bulk strings at the top level — that's how
-     * real Redis clients send commands. Inline command syntax (no *N) is
-     * not supported. */
-    if (buf[0] != '*') return RESP_ERR;
+    /* Top level may be a multi-bulk array (*N\r\n...) or an inline
+     * command. Real Redis clients use multi-bulk; redis-cli falls
+     * back to inline for some commands, and redis-benchmark uses
+     * inline for its PING_INLINE test. */
+    if (buf[0] != '*') return parse_inline(buf, len, cmd, consumed);
 
     size_t pos = 1;
     long long argc;
