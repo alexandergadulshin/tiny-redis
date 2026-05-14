@@ -117,20 +117,50 @@ static int handle_client_read(client_t *c) {
     return 0;
 }
 
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "usage: %s [PORT] [--port PORT] [--max-keys N]\n"
+        "  PORT          listen port (default %d)\n"
+        "  --max-keys N  evict LRU entries when more than N keys are stored\n",
+        prog, DEFAULT_PORT);
+}
+
 int main(int argc, char **argv) {
     int port = DEFAULT_PORT;
-    if (argc > 1) {
-        port = atoi(argv[1]);
-        if (port <= 0 || port > 65535) {
-            fprintf(stderr, "invalid port: %s\n", argv[1]);
+    long long max_keys = 0;
+
+    int i = 1;
+    if (i < argc && argv[i][0] != '-') {
+        port = atoi(argv[i++]);
+    }
+    while (i < argc) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            port = atoi(argv[++i]); i++;
+        } else if (strcmp(argv[i], "--max-keys") == 0 && i + 1 < argc) {
+            max_keys = atoll(argv[++i]); i++;
+            if (max_keys < 0) { fprintf(stderr, "max-keys must be >= 0\n"); return EXIT_FAILURE; }
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]); return EXIT_SUCCESS;
+        } else {
+            fprintf(stderr, "unknown arg: %s\n", argv[i]);
+            usage(argv[0]);
             return EXIT_FAILURE;
         }
     }
+    if (port <= 0 || port > 65535) {
+        fprintf(stderr, "invalid port: %d\n", port);
+        return EXIT_FAILURE;
+    }
 
-    store_init(0);  /* unlimited; CLI flag added in a later commit */
+    store_init((size_t)max_keys);
 
     int listen_fd = make_listener(port);
-    fprintf(stderr, "tiny-redis: listening on port %d (RESP2)\n", port);
+    if (max_keys > 0) {
+        fprintf(stderr, "tiny-redis: listening on port %d (max-keys=%lld, LRU eviction on)\n",
+                port, max_keys);
+    } else {
+        fprintf(stderr, "tiny-redis: listening on port %d (RESP2)\n", port);
+    }
 
     for (;;) {
         fd_set readfds;

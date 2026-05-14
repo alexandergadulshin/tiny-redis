@@ -112,6 +112,11 @@ static size_t do_command(const resp_command *cmd, char *out, size_t cap) {
     return resp_write_empty_array(out, cap);
 }
 
+static size_t do_dbsize(const resp_command *cmd, char *out, size_t cap) {
+    (void)cmd;
+    return resp_write_integer(out, cap, (long long)store_dbsize());
+}
+
 size_t command_dispatch(const resp_command *cmd, char *out, size_t out_cap) {
     if (cmd->argc < 1) return resp_write_error(out, out_cap, "ERR empty command");
 
@@ -124,6 +129,7 @@ size_t command_dispatch(const resp_command *cmd, char *out, size_t out_cap) {
     if (cmd_is(cmd, "EXPIRE"))  return do_expire(cmd, out, out_cap);
     if (cmd_is(cmd, "TTL"))     return do_ttl(cmd, out, out_cap);
     if (cmd_is(cmd, "COMMAND")) return do_command(cmd, out, out_cap);
+    if (cmd_is(cmd, "DBSIZE"))  return do_dbsize(cmd, out, out_cap);
 
     return resp_write_error(out, out_cap, "ERR unknown command");
 }
