@@ -34,4 +34,9 @@ size_t resp_write_bulk_string(char *out, size_t cap, const char *s, size_t len);
 size_t resp_write_null_bulk(char *out, size_t cap);
 size_t resp_write_empty_array(char *out, size_t cap);
 
+/* Re-serialize a parsed command back to RESP multi-bulk wire format.
+ * Used by the WAL to log writes in a normalized form regardless of
+ * whether the client sent inline or multi-bulk. */
+size_t resp_serialize_command(const resp_command *cmd, char *out, size_t cap);
+
 #endif

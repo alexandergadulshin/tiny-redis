@@ -10,6 +10,7 @@
 #include "resp.h"
 #include "commands.h"
 #include "store.h"
+#include "wal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,15 +120,17 @@ static int handle_client_read(client_t *c) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "usage: %s [PORT] [--port PORT] [--max-keys N]\n"
-        "  PORT          listen port (default %d)\n"
-        "  --max-keys N  evict LRU entries when more than N keys are stored\n",
+        "usage: %s [PORT] [--port PORT] [--max-keys N] [--aof-file PATH]\n"
+        "  PORT             listen port (default %d)\n"
+        "  --max-keys N     evict LRU entries when more than N keys are stored\n"
+        "  --aof-file PATH  append-only log: replayed on startup, written live\n",
         prog, DEFAULT_PORT);
 }
 
 int main(int argc, char **argv) {
     int port = DEFAULT_PORT;
     long long max_keys = 0;
+    const char *aof_path = NULL;
 
     int i = 1;
     if (i < argc && argv[i][0] != '-') {
@@ -139,6 +142,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--max-keys") == 0 && i + 1 < argc) {
             max_keys = atoll(argv[++i]); i++;
             if (max_keys < 0) { fprintf(stderr, "max-keys must be >= 0\n"); return EXIT_FAILURE; }
+        } else if (strcmp(argv[i], "--aof-file") == 0 && i + 1 < argc) {
+            aof_path = argv[++i]; i++;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]); return EXIT_SUCCESS;
         } else {
@@ -153,6 +158,7 @@ int main(int argc, char **argv) {
     }
 
     store_init((size_t)max_keys);
+    wal_init(aof_path);  /* replays existing log; no-op if NULL */
 
     int listen_fd = make_listener(port);
     if (max_keys > 0) {

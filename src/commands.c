@@ -1,5 +1,6 @@
 #include "commands.h"
 #include "store.h"
+#include "wal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -233,7 +234,19 @@ static size_t do_type(const resp_command *cmd, char *out, size_t cap) {
     return resp_write_simple_string(out, cap, ty);
 }
 
-size_t command_dispatch(const resp_command *cmd, char *out, size_t out_cap) {
+/* Whitelist of commands that mutate the store. Used to decide whether to
+ * append to the WAL after a successful dispatch. */
+static int is_write_command(const resp_command *cmd) {
+    static const char *writes[] = {
+        "SET", "DEL", "EXPIRE", "INCR", "DECR", "MSET", "APPEND", "FLUSHDB",
+    };
+    for (size_t i = 0; i < sizeof(writes) / sizeof(*writes); i++) {
+        if (cmd_is(cmd, writes[i])) return 1;
+    }
+    return 0;
+}
+
+static size_t dispatch_inner(const resp_command *cmd, char *out, size_t out_cap) {
     if (cmd->argc < 1) return resp_write_error(out, out_cap, "ERR empty command");
 
     if (cmd_is(cmd, "PING"))    return do_ping(cmd, out, out_cap);
@@ -257,4 +270,17 @@ size_t command_dispatch(const resp_command *cmd, char *out, size_t out_cap) {
     if (cmd_is(cmd, "TYPE"))    return do_type(cmd, out, out_cap);
 
     return resp_write_error(out, out_cap, "ERR unknown command");
+}
+
+size_t command_dispatch(const resp_command *cmd, char *out, size_t out_cap) {
+    size_t n = dispatch_inner(cmd, out, out_cap);
+
+    /* Append successful write commands to the WAL. We treat a leading '-'
+     * as a RESP error reply (no state changed) and skip those. */
+    if (n > 0 && out[0] != '-' && is_write_command(cmd)) {
+        char wbuf[16384];
+        size_t wlen = resp_serialize_command(cmd, wbuf, sizeof(wbuf));
+        if (wlen > 0) wal_append(wbuf, wlen);
+    }
+    return n;
 }

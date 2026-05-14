@@ -140,3 +140,16 @@ size_t resp_write_empty_array(char *out, size_t cap) {
     memcpy(out, s, 4);
     return 4;
 }
+
+size_t resp_serialize_command(const resp_command *cmd, char *out, size_t cap) {
+    int n = snprintf(out, cap, "*%d\r\n", cmd->argc);
+    if (n <= 0 || (size_t)n >= cap) return 0;
+    size_t pos = (size_t)n;
+    for (int i = 0; i < cmd->argc; i++) {
+        size_t w = resp_write_bulk_string(out + pos, cap - pos,
+                                          cmd->argv[i], cmd->arglen[i]);
+        if (w == 0) return 0;
+        pos += w;
+    }
+    return pos;
+}
