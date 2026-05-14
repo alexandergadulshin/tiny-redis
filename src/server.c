@@ -1,13 +1,15 @@
 /*
- * tiny-redis: TCP server (Day 2)
+ * tiny-redis server
  *
- * Multi-client TCP echo server using select() for I/O multiplexing.
- * Single-threaded, single-process. select() is sufficient for the
- * benchmark workload and simpler to reason about than epoll/kqueue.
- *
- * Next step (Day 3-4): replace echo with a RESP protocol parser so the
- * server speaks actual Redis wire format.
+ * select()-based multi-client server speaking RESP2. Each client has its
+ * own input buffer; we attempt to parse zero or more complete commands
+ * from the buffer after every read, dispatch them, and write the RESP
+ * reply back synchronously.
  */
+
+#include "resp.h"
+#include "commands.h"
+#include "store.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,13 +23,22 @@
 
 #define DEFAULT_PORT 6379
 #define BACKLOG      16
-#define BUFFER_SIZE  4096
-#define MAX_CLIENTS  FD_SETSIZE  /* typically 1024; plenty for v1 */
+#define INBUF_SIZE   (64 * 1024)
+#define OUTBUF_SIZE  (64 * 1024)
+#define MAX_CLIENTS  FD_SETSIZE
 
-static void die(const char *msg) {
-    perror(msg);
-    exit(EXIT_FAILURE);
-}
+typedef struct {
+    int    fd;
+    char   inbuf[INBUF_SIZE];
+    size_t inlen;
+} client_t;
+
+/* File-scope so the ~64 MB clients table lives in BSS, not on the stack
+ * (macOS default stack is 8 MB; 1024 * 64 KB would blow it up). */
+static client_t clients[MAX_CLIENTS];
+static int      num_clients = 0;
+
+static void die(const char *msg) { perror(msg); exit(EXIT_FAILURE); }
 
 static int make_listener(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -50,27 +61,58 @@ static int make_listener(int port) {
     return fd;
 }
 
-/* One round-trip read+echo on a client fd. Returns 0 on success,
- * -1 on disconnect or error (caller closes the fd). */
-static int echo_once(int client_fd) {
-    char buf[BUFFER_SIZE];
-    ssize_t n = read(client_fd, buf, sizeof(buf));
-    if (n < 0) {
-        perror("read");
-        return -1;
-    }
-    if (n == 0) {
-        return -1;  /* clean disconnect */
-    }
-
-    ssize_t total = 0;
-    while (total < n) {
-        ssize_t w = write(client_fd, buf + total, n - total);
+/* Write n bytes, handling short writes. Returns 0 on success, -1 on error. */
+static int write_all(int fd, const char *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, buf + off, n - off);
         if (w < 0) {
-            perror("write");
+            if (errno == EINTR) continue;
             return -1;
         }
-        total += w;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+/* Returns 0 on success, -1 if the client should be disconnected. */
+static int handle_client_read(client_t *c) {
+    /* Append to existing input buffer. */
+    if (c->inlen == INBUF_SIZE) {
+        /* Buffer full and we couldn't parse a command from it — bail. */
+        return -1;
+    }
+    ssize_t n = read(c->fd, c->inbuf + c->inlen, INBUF_SIZE - c->inlen);
+    if (n < 0) {
+        if (errno == EINTR) return 0;
+        return -1;
+    }
+    if (n == 0) return -1;  /* clean disconnect */
+    c->inlen += (size_t)n;
+
+    /* Parse as many complete commands as we can. */
+    char out[OUTBUF_SIZE];
+    for (;;) {
+        resp_command cmd;
+        size_t consumed = 0;
+        resp_status s = resp_parse_command(c->inbuf, c->inlen, &cmd, &consumed);
+
+        if (s == RESP_INCOMPLETE) break;
+        if (s == RESP_ERR) {
+            size_t en = resp_write_error(out, sizeof(out), "ERR Protocol error");
+            (void)write_all(c->fd, out, en);
+            return -1;
+        }
+
+        size_t reply_len = command_dispatch(&cmd, out, sizeof(out));
+        if (write_all(c->fd, out, reply_len) < 0) return -1;
+
+        /* Slide remaining bytes to the front. */
+        size_t remaining = c->inlen - consumed;
+        if (remaining > 0) memmove(c->inbuf, c->inbuf + consumed, remaining);
+        c->inlen = remaining;
+
+        if (c->inlen == 0) break;
     }
     return 0;
 }
@@ -85,11 +127,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    int listen_fd = make_listener(port);
-    fprintf(stderr, "tiny-redis: listening on port %d (select-based)\n", port);
+    store_init();
 
-    int clients[MAX_CLIENTS];
-    int num_clients = 0;
+    int listen_fd = make_listener(port);
+    fprintf(stderr, "tiny-redis: listening on port %d (RESP2)\n", port);
 
     for (;;) {
         fd_set readfds;
@@ -98,8 +139,8 @@ int main(int argc, char **argv) {
         int max_fd = listen_fd;
 
         for (int i = 0; i < num_clients; i++) {
-            FD_SET(clients[i], &readfds);
-            if (clients[i] > max_fd) max_fd = clients[i];
+            FD_SET(clients[i].fd, &readfds);
+            if (clients[i].fd > max_fd) max_fd = clients[i].fd;
         }
 
         int ready = select(max_fd + 1, &readfds, NULL, NULL, NULL);
@@ -108,7 +149,6 @@ int main(int argc, char **argv) {
             die("select");
         }
 
-        /* Accept new connections. */
         if (FD_ISSET(listen_fd, &readfds)) {
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
@@ -119,7 +159,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "max clients reached; dropping connection\n");
                 close(client_fd);
             } else {
-                clients[num_clients++] = client_fd;
+                client_t *c = &clients[num_clients++];
+                c->fd = client_fd;
+                c->inlen = 0;
                 char ip[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
                 fprintf(stderr, "client connected: %s:%d (active: %d)\n",
@@ -127,13 +169,10 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Service ready clients. Iterate backwards so swap-remove is safe. */
         for (int i = num_clients - 1; i >= 0; i--) {
-            int cfd = clients[i];
-            if (!FD_ISSET(cfd, &readfds)) continue;
-
-            if (echo_once(cfd) < 0) {
-                close(cfd);
+            if (!FD_ISSET(clients[i].fd, &readfds)) continue;
+            if (handle_client_read(&clients[i]) < 0) {
+                close(clients[i].fd);
                 clients[i] = clients[num_clients - 1];
                 num_clients--;
                 fprintf(stderr, "client disconnected (active: %d)\n", num_clients);
@@ -141,6 +180,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    close(listen_fd);  /* unreachable but tidy */
+    close(listen_fd);
+    store_destroy();
     return 0;
 }
