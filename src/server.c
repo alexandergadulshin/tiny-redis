@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    store_init();
+    store_init(0);  /* unlimited; CLI flag added in a later commit */
 
     int listen_fd = make_listener(port);
     fprintf(stderr, "tiny-redis: listening on port %d (RESP2)\n", port);
