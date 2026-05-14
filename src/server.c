@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netinet/in.h>
@@ -27,6 +28,17 @@
 #define INBUF_SIZE   (64 * 1024)
 #define OUTBUF_SIZE  (64 * 1024)
 #define MAX_CLIENTS  FD_SETSIZE
+
+#define SELECT_TIMEOUT_MS  100   /* wake the main loop this often */
+#define SWEEP_INTERVAL_MS  100   /* run TTL sweep this often (each cycle) */
+#define SWEEP_SAMPLES       50   /* random slots per sample batch */
+#define SWEEP_MAX_BATCHES   16   /* cap on adaptive batches per cycle */
+
+static long long monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 typedef struct {
     int    fd;
@@ -168,6 +180,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "tiny-redis: listening on port %d (RESP2)\n", port);
     }
 
+    long long last_sweep_ms = monotonic_ms();
+
     for (;;) {
         fd_set readfds;
         FD_ZERO(&readfds);
@@ -179,11 +193,27 @@ int main(int argc, char **argv) {
             if (clients[i].fd > max_fd) max_fd = clients[i].fd;
         }
 
-        int ready = select(max_fd + 1, &readfds, NULL, NULL, NULL);
+        struct timeval tv = { 0, SELECT_TIMEOUT_MS * 1000 };
+        int ready = select(max_fd + 1, &readfds, NULL, NULL, &tv);
         if (ready < 0) {
             if (errno == EINTR) continue;
             die("select");
         }
+
+        /* Periodic active TTL sweep. Matches Redis's adaptive pattern:
+         * sample a batch of random slots, and if the hit rate is high
+         * (lots of expired entries), keep going within this cycle.
+         * Passive (on-access) reaping still applies alongside this. */
+        long long now_ms = monotonic_ms();
+        if (now_ms - last_sweep_ms >= SWEEP_INTERVAL_MS) {
+            for (int b = 0; b < SWEEP_MAX_BATCHES; b++) {
+                int reaped = store_sweep_random(SWEEP_SAMPLES);
+                if (reaped * 4 < SWEEP_SAMPLES) break;  /* < 25% expired */
+            }
+            last_sweep_ms = now_ms;
+        }
+
+        if (ready == 0) continue;  /* nothing ready — back to top */
 
         if (FD_ISSET(listen_fd, &readfds)) {
             struct sockaddr_in client_addr;
